@@ -1,0 +1,807 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import random
+import io
+import requests
+import base64
+import sys
+import ssl
+from datetime import datetime, timezone
+
+# --- CONSTANTS ---
+ID_COLUMN = 'Issue'
+SUMMARY_COLUMN = 'Summary'
+TOTAL_LEAD_TIME_COLUMN = 'Total Days' 
+METADATA_COLUMNS = [ID_COLUMN, SUMMARY_COLUMN, 'Type', TOTAL_LEAD_TIME_COLUMN, 'Created', 'ResolutionDate']
+
+# --- JIRA API HELPER FUNCTIONS ---
+
+def test_jira_connection_simple(domain, email, api_token):
+    """Simple test to verify credentials against the /myself endpoint."""
+    domain = domain.strip().rstrip('/')
+    if not domain.startswith("https"):
+        domain = "https://" + domain
+        
+    url = f"{domain}/rest/api/3/myself"
+    
+    auth_str = f"{email}:{api_token}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {b64_auth}",
+        "X-Atlassian-Token": "no-check",
+        "User-Agent": "StreamlitDash/1.0"
+    }
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            user_data = response.json()
+            return True, f"Success! Connected as: {user_data.get('displayName', 'Unknown User')}"
+        elif response.status_code == 401:
+            return False, "401 Unauthorized: The Email or API Token is incorrect."
+        elif response.status_code == 404:
+            return False, f"404 Not Found: Could not find Jira instance at {domain}. Check the domain URL."
+        else:
+            return False, f"Connection Failed ({response.status_code}): {response.text}"
+            
+    except Exception as e:
+        return False, f"Network Error: {str(e)}"
+
+def fetch_issue_history_individually(domain, headers, issue_key):
+    """Fetches full details for a single issue including changelog."""
+    url = f"{domain}/rest/api/3/issue/{issue_key}"
+    params = {
+        "fields": "created,summary,status,issuetype,resolutiondate",
+        "expand": "changelog"
+    }
+    try:
+        r = requests.get(url, headers=headers, params=params)
+        if r.status_code == 200:
+            return r.json()
+    except:
+        pass
+    return None
+
+def fetch_jira_issues_robust(domain, email, api_token, jql, max_results=1000, manual_endpoint=None, manual_method=None):
+    """
+    Fetches issues from Jira API using robust fallback strategies.
+    If bulk expansion fails, it fetches history individually.
+    """
+    
+    # 1. Force HTTPS
+    domain = domain.strip().rstrip('/')
+    if not domain.startswith("https"):
+        domain = domain.replace("http://", "https://") if domain.startswith("http://") else "https://" + domain
+    
+    auth_str = f"{email}:{api_token}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": f"Basic {b64_auth}",
+        "X-Atlassian-Token": "no-check",
+        "User-Agent": "StreamlitDash/1.0"
+    }
+    
+    issues = []
+    start_at = 0
+    
+    status_placeholder = st.empty()
+    status_placeholder.info(f"🚀 Negotiating connection to Jira...")
+    
+    # Define candidates
+    candidate_endpoints = []
+    if manual_endpoint:
+        if manual_endpoint.startswith("http"):
+            candidate_endpoints.append(manual_endpoint)
+        else:
+            candidate_endpoints.append(f"{domain}/{manual_endpoint.lstrip('/')}")
+    else:
+        # Auto-detect candidates
+        candidate_endpoints = [
+            f"{domain}/rest/api/3/search/jql", 
+            f"{domain}/rest/api/3/search",     
+            f"{domain}/rest/api/2/search"
+        ]
+    
+    # Configuration to lock onto once found
+    active_config = None
+    connection_errors = []
+
+    # --- ENDPOINT DISCOVERY PHASE ---
+    if not active_config:
+        for url in candidate_endpoints:
+            # Strategies to try
+            strategies = [
+                {"method": "POST", "key": "jql", "expand": True},
+                {"method": "POST", "key": "jql", "expand": False}, # Fallback without changelog
+                {"method": "GET", "key": "jql", "expand": True},   
+                {"method": "GET", "key": "jql", "expand": False},
+                {"method": "POST_HYBRID", "key": "jql", "expand": True} 
+            ]
+            
+            if manual_method:
+                strategies = [s for s in strategies if s["method"] == manual_method]
+
+            for strategy in strategies:
+                test_params = {
+                    strategy["key"]: jql,
+                    "maxResults": 1,
+                    "fields": ["key"]
+                }
+                
+                if "/search/jql" not in url:
+                    test_params["startAt"] = 0
+                
+                if strategy["expand"]:
+                    if strategy["method"] == "GET" or strategy["method"] == "POST_HYBRID":
+                         test_params["expand"] = "changelog"
+                    else:
+                         test_params["expand"] = ["changelog"]
+                
+                try:
+                    r = None
+                    if strategy["method"] == "GET":
+                        r = requests.get(url, headers=headers, params=test_params)
+                    elif strategy["method"] == "POST_HYBRID":
+                        r = requests.post(url, headers=headers, params=test_params, json={})
+                    else: # POST
+                        r = requests.post(url, headers=headers, json=test_params)
+                    
+                    try:
+                        err_json = r.json()
+                        err_msg = str(err_json.get('errorMessages', []) or err_json.get('errors', {}))
+                    except:
+                        err_msg = r.text[:150]
+                    
+                    if r.status_code in [200, 201]:
+                        # SUCCESS: Lock this configuration
+                        active_config = {
+                            "url": url,
+                            "method": strategy["method"],
+                            "key": strategy["key"],
+                            "expand": strategy["expand"]
+                        }
+                        
+                        status_placeholder.info(f"Connected via {active_config['method']} to {active_config['url']}")
+                        break
+                    
+                    connection_errors.append(f"{strategy['method']} {url} [expand={strategy['expand']}] -> {r.status_code}: {err_msg}")
+
+                except requests.exceptions.RequestException as e:
+                    connection_errors.append(f"{strategy['method']} {url} failed: {e}")
+                    continue
+            
+            if active_config:
+                break
+            
+    if not active_config:
+        debug_msg = "\n\n".join(list(set(connection_errors)))
+        status_placeholder.error(f"❌ Could not connect to any search endpoint.\n\nDetails:\n{debug_msg}")
+        return None
+
+    # --- FETCHING PHASE ---
+    start_at = 0
+    next_page_token = None
+    is_cursor_pagination = "/search/jql" in active_config["url"] 
+    
+    # Fields Strategy
+    fields_strategies = [
+        ["summary", "created", "resolutiondate", "issuetype", "status"], 
+        ["created", "resolutiondate"] 
+    ]
+    current_fields_idx = 0
+    
+    while True:
+        current_fields = fields_strategies[current_fields_idx]
+        
+        try:
+            response = None
+            
+            # Base parameters
+            req_data = {
+                active_config["key"]: jql,
+                "maxResults": 50, # Reduced batch size
+            }
+            
+            if is_cursor_pagination:
+                if next_page_token:
+                    req_data["nextPageToken"] = next_page_token
+            else:
+                req_data["startAt"] = start_at
+
+            # Fields
+            if active_config["method"] == "POST":
+                req_data["fields"] = current_fields
+            else:
+                req_data["fields"] = ",".join(current_fields)
+            
+            # Expand
+            if active_config["expand"]:
+                if active_config["method"] == "POST":
+                    req_data["expand"] = ["changelog"]
+                else:
+                    req_data["expand"] = "changelog"
+
+            # Execute Request
+            if active_config["method"] == "GET":
+                response = requests.get(active_config["url"], headers=headers, params=req_data)
+            elif active_config["method"] == "POST_HYBRID":
+                response = requests.post(active_config["url"], headers=headers, params=req_data, json={})
+            else: # POST
+                response = requests.post(active_config["url"], headers=headers, json=req_data)
+
+            # --- ERROR HANDLING ---
+            if response.status_code == 400 and current_fields_idx < len(fields_strategies) - 1:
+                st.warning("⚠️ Specific field request rejected. Downgrading to minimal fields...")
+                current_fields_idx += 1 
+                continue 
+
+            if not response.ok:
+                status_placeholder.error(f"⚠️ API Error ({response.status_code}): {response.text[:200]}")
+                return None
+
+            data = response.json()
+            batch = data.get("issues", [])
+            if not batch:
+                break
+                
+            issues.extend(batch)
+            status_placeholder.info(f"⏳ Fetched {len(issues)} issues...")
+            
+            # Advance Pagination based on type
+            if is_cursor_pagination:
+                next_page_token = data.get("nextPageToken")
+                if not next_page_token:
+                    break # End of cursor results
+            else:
+                start_at += len(batch)
+                if start_at >= data["total"] or len(issues) >= max_results:
+                    break
+                
+        except requests.exceptions.RequestException as e:
+            status_placeholder.error(f"Network Error: {e}")
+            return None
+
+    # --- HISTORY ENRICHMENT PHASE ---
+    history_missing = False
+    if issues and "changelog" not in issues[0]:
+        history_missing = True
+    
+    if history_missing:
+        status_placeholder.warning(f"⚠️ Bulk history failed. Fetching history individually for {len(issues)} issues. This may take a moment...")
+        progress_bar = st.progress(0)
+        
+        enriched_issues = []
+        for i, issue in enumerate(issues):
+            full_issue = fetch_issue_history_individually(domain, headers, issue["key"])
+            if full_issue:
+                enriched_issues.append(full_issue)
+            else:
+                enriched_issues.append(issue) # Keep basic if fail
+            
+            if i % 5 == 0:
+                progress_bar.progress((i + 1) / len(issues))
+        
+        progress_bar.empty()
+        issues = enriched_issues
+        status_placeholder.success(f"✅ Successfully fetched and enriched {len(issues)} issues.")
+    else:
+        status_placeholder.success(f"✅ Successfully fetched {len(issues)} issues.")
+        
+    return issues
+
+def process_jira_history(issues):
+    """Parses Jira changelogs to calculate Time in Status (Days)."""
+    rows = []
+    
+    for issue in issues:
+        key = issue["key"]
+        fields = issue["fields"]
+        summary = fields.get("summary", "")
+        # Handle issue type safely
+        itype = fields.get("issuetype")
+        issue_type = itype.get("name", "Unknown") if itype else "Unknown"
+        
+        created_str = fields.get("created", "")
+        resolution_str = fields.get("resolutiondate")
+        
+        try:
+            created_dt = datetime.strptime(created_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        except:
+            created_dt = datetime.now(timezone.utc)
+
+        if resolution_str:
+            try:
+                res_dt = datetime.strptime(resolution_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+            except:
+                res_dt = datetime.now(timezone.utc)
+        else:
+            res_dt = datetime.now(timezone.utc)
+
+        total_days = max(0, (res_dt - created_dt).total_seconds() / 86400)
+        
+        row = {
+            ID_COLUMN: key,
+            SUMMARY_COLUMN: summary,
+            'Type': issue_type,
+            TOTAL_LEAD_TIME_COLUMN: total_days,
+            'Created': created_str,
+            'ResolutionDate': resolution_str
+        }
+        
+        # CHANGELOG PROCESSING
+        histories = issue.get("changelog", {}).get("histories", [])
+        status_durations = {} 
+        
+        if histories:
+            try:
+                histories.sort(key=lambda x: x.get("created", ""))
+            except:
+                pass
+            
+            current_status = "To Do" 
+            for h in histories:
+                for item in h.get("items", []):
+                    if item.get("field") == "status":
+                        current_status = item.get("fromString")
+                        break
+                if current_status != "To Do": break
+                
+            last_change_dt = created_dt
+            
+            for history in histories:
+                change_str = history.get("created", "")
+                try:
+                    change_dt = datetime.strptime(change_str[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                except:
+                    continue
+                    
+                status_item = next((item for item in history.get("items", []) if item.get("field") == "status"), None)
+                
+                if status_item:
+                    duration = max(0, (change_dt - last_change_dt).total_seconds() / 86400)
+                    status_durations[current_status] = status_durations.get(current_status, 0) + duration
+                    
+                    current_status = status_item.get("toString", current_status)
+                    last_change_dt = change_dt
+            
+            final_duration = max(0, (res_dt - last_change_dt).total_seconds() / 86400)
+            status_durations[current_status] = status_durations.get(current_status, 0) + final_duration
+            
+        else:
+            # FALLBACK: Create a synthetic column so the dashboard still renders charts
+            status_durations["Time (Lead Time Only)"] = total_days
+        
+        row.update(status_durations)
+        rows.append(row)
+        
+    df = pd.DataFrame(rows).fillna(0)
+    return df
+
+# --- MONTE CARLO FUNCTIONS ---
+def run_monte_carlo(historical_data, items_to_forecast, num_simulations):
+    """ Runs the Monte Carlo simulation """
+    simulation_results = []
+    valid_history = [x for x in historical_data if x >= 0]
+    
+    if not valid_history:
+        return {'p50': 0, 'p85': 0, 'p95': 0}
+
+    for _ in range(num_simulations):
+        forecast_sample = random.choices(valid_history, k=items_to_forecast)
+        simulation_results.append(sum(forecast_sample))
+
+    results = {
+        'p50': np.percentile(simulation_results, 50),
+        'p85': np.percentile(simulation_results, 85),
+        'p95': np.percentile(simulation_results, 95)
+    }
+    return results
+
+def display_forecast(results, items_to_forecast):
+    """ Displays the forecast results in a table """
+    st.markdown(f"**Forecasting delivery of the next {items_to_forecast} items:**")
+    
+    data = {
+        'Confidence Level': ['50% (Expected)', '85% (Service Level Expectation)', '95% (Worst-Case)'],
+        'Delivery Time (Days)': [f"{results['p50']:.0f}", f"{results['p85']:.0f}", f"{results['p95']:.0f}"]
+    }
+    df = pd.DataFrame(data)
+    st.table(df)
+
+
+# --- MAIN STREAMLIT APP ---
+st.set_page_config(layout="wide")
+st.title("⚙️ Value Stream Performance & Prediction Engine")
+st.markdown("Use this tool to analyze your flow metrics, identify the system **Constraint**, and model the strategic impact of process improvements.")
+
+# Static Placeholder for Value Stream Map Image
+st.subheader("Current Value Stream Flow (Discovery to Production)")
+st.divider()
+
+# --- INITIALIZE SESSION STATE ---
+if 'jira_data' not in st.session_state:
+    st.session_state['jira_data'] = None
+
+# --- DATA SOURCE SELECTOR ---
+data_source = st.sidebar.radio("Data Source", ["CSV Upload", "Jira API (Live)"])
+
+if data_source == "CSV Upload":
+    uploaded_file = st.file_uploader(
+        "Upload Jira Time in Status CSV", 
+        type="csv", 
+        help="Use the CSV exported from your Jira Time in Status report."
+    )
+    if uploaded_file is not None:
+        try:
+            # Persist uploaded data to session state
+            st.session_state['jira_data'] = pd.read_csv(io.StringIO(uploaded_file.getvalue().decode("utf-8")))
+        except Exception as e:
+            st.error(f"Error reading CSV: {e}")
+
+elif data_source == "Jira API (Live)":
+    
+    with st.expander("🔌 Jira Connection Settings", expanded=True):
+        jira_domain = st.text_input("Jira Domain (e.g., https://yourcompany.atlassian.net)")
+        jira_email = st.text_input("Email Address")
+        jira_token = st.text_input("API Token", type="password", help="Generate at https://id.atlassian.com/manage-profile/security/api-tokens")
+        
+        # Cleanup inputs
+        jira_domain = jira_domain.strip()
+        jira_email = jira_email.strip()
+        jira_token = jira_token.strip()
+        
+        # Default JQL updated to the user's requested example
+        default_jql = "project = \"PROJECTID\" AND status in (Done, Closed) AND created >= -90d ORDER BY created DESC"
+        jira_jql = st.text_input("JQL Query", value=default_jql)
+        st.caption("Example: `project = \"PROJECTID\" AND status in (Done, Closed) AND created >= -90d`")
+        
+        if st.button("🔑 Test Credentials"):
+            if jira_domain and jira_email and jira_token:
+                success, msg = test_jira_connection_simple(jira_domain, jira_email, jira_token)
+                if success:
+                    st.success(msg)
+                else:
+                    st.error(msg)
+            else:
+                st.warning("Enter Domain, Email, and Token first.")
+
+        if st.button("Fetch Data from Jira"):
+            if jira_domain and jira_email and jira_token:
+                # Perform the robust fetch
+                raw_issues = fetch_jira_issues_robust(
+                    domain=jira_domain, 
+                    email=jira_email, 
+                    api_token=jira_token, 
+                    jql=jira_jql
+                )
+                if raw_issues:
+                    # Persist fetched data to session state
+                    st.session_state['jira_data'] = process_jira_history(raw_issues)
+            else:
+                st.error("Please fill in all connection details.")
+
+# --- ANALYSIS LOGIC ---
+# Check session state instead of local variable
+if st.session_state['jira_data'] is not None:
+    data = st.session_state['jira_data'] # Use the persisted dataframe
+    
+    try:
+        # --- DYNAMIC COLUMN DETECTION ---
+        all_columns = data.columns.tolist()
+        
+        # Identify raw stage columns by excluding known metadata columns
+        # Also exclude columns that appear to be metadata (like Created/ResolutionDate)
+        raw_stage_columns = [col for col in all_columns if col not in METADATA_COLUMNS and col not in ['Created', 'ResolutionDate']]
+        
+        # --- SIDEBAR CONFIGURATION ---
+        st.sidebar.header("Workflow Configuration")
+        st.sidebar.markdown("**Configure your stages below to match your process.**")
+        
+        # 1. IGNORE STAGES
+        ignored_stages = st.sidebar.multiselect(
+            "❌ Select Stages to IGNORE (Exclude from analysis)",
+            options=raw_stage_columns,
+            default=[],
+            help="Time spent in these selected stages will be completely removed from Cycle Time, Lead Time, and Bottleneck calculations."
+        )
+        
+        stage_columns = [col for col in raw_stage_columns if col not in ignored_stages]
+        
+        if not stage_columns:
+            st.warning("⚠️ No time-in-status columns detected. This might be because the Jira connection failed to fetch History/Changelog data.")
+            # Fallback to prevent crash
+            selected_done_column = None
+            active_stage_columns = []
+            selected_va_stages = []
+            selected_nva_stages = []
+        else:
+            # 2. Select Done Column
+            potential_done_names = ['Done', 'Closed', 'Resolved', 'Complete', 'Released']
+            done_column = next((col for col in potential_done_names if col in stage_columns), None)
+            
+            default_index = 0
+            if done_column:
+                try:
+                    default_index = stage_columns.index(done_column)
+                except ValueError:
+                    default_index = 0
+
+            selected_done_column = st.sidebar.selectbox(
+                "✅ Select your 'Done' / Completion Stage",
+                options=stage_columns,
+                index=default_index,
+                help="Time in this stage is excluded from Cycle Time but included in Lead Time."
+            )
+            
+            # 3. Filter out Done column from active stages
+            active_stage_columns = [col for col in stage_columns if col != selected_done_column]
+            
+            # 4. Select Value Added stages
+            default_va = ['In Progress', 'Review', 'Build', 'Testing', 'Dev', 'QA']
+            pre_selected_va = [col for col in active_stage_columns if any(x.lower() in col.lower() for x in default_va)]
+            
+            selected_va_stages = st.sidebar.multiselect(
+                "🛠️ Select Value-Added (Work) Stages",
+                options=active_stage_columns,
+                default=pre_selected_va,
+                help="Stages where active work is happening."
+            )
+            
+            # NVA is everything else
+            selected_nva_stages = [col for col in active_stage_columns if col not in selected_va_stages]
+            
+            st.sidebar.markdown("---")
+            st.sidebar.markdown("**Detected NVA (Wait) Stages:**")
+            for stage in selected_nva_stages:
+                st.sidebar.text(f"• {stage}")
+            
+        
+        # --- DATA PROCESSING & METRICS ---
+        completed_data = data.copy()
+        
+        if active_stage_columns:
+            # 1. Cycle Time: Sum of all active/wait stages (EXCLUDING DONE)
+            completed_data['Cycle_Time_Days'] = completed_data[active_stage_columns].sum(axis=1)
+
+            # 2. Value-Added (VA) Time
+            completed_data['VA_Time_Days'] = completed_data[selected_va_stages].sum(axis=1)
+
+            # 3. Non-Value-Added (NVA) Time (Wait in Queue)
+            completed_data['NVA_Time_Days'] = completed_data[selected_nva_stages].sum(axis=1)
+        else:
+            # Fallback if no history columns
+            completed_data['Cycle_Time_Days'] = 0
+            completed_data['VA_Time_Days'] = 0
+            completed_data['NVA_Time_Days'] = 0
+        
+        # 4. Done Time
+        if selected_done_column and selected_done_column in completed_data.columns:
+             avg_done_time = completed_data[selected_done_column].mean()
+        else:
+             avg_done_time = 0.0
+
+        # 5. Average Lead Time
+        if TOTAL_LEAD_TIME_COLUMN in completed_data.columns:
+            # Prefer the explicit Total Days column if valid
+            avg_lead_time_total = completed_data[TOTAL_LEAD_TIME_COLUMN].mean()
+        elif active_stage_columns:
+            # Recalculate based on SELECTED stages only
+            completed_data['Calculated_Lead_Time'] = completed_data[stage_columns].sum(axis=1)
+            avg_lead_time_total = completed_data['Calculated_Lead_Time'].mean()
+        else:
+            # If no stages (e.g. Lead Time Only fallback), use the total_days from fetch
+            if TOTAL_LEAD_TIME_COLUMN in completed_data.columns:
+                 avg_lead_time_total = completed_data[TOTAL_LEAD_TIME_COLUMN].mean()
+            else:
+                 avg_lead_time_total = 0.0
+        
+        # 6. Average DELIVERY Lead Time
+        avg_delivery_lead_time = avg_lead_time_total - avg_done_time
+
+        # 7. Average Backlog Time
+        avg_backlog_time = avg_delivery_lead_time - completed_data['Cycle_Time_Days'].mean()
+        
+        # Bottleneck Analysis
+        bottleneck_stage = "N/A"
+        avg_time_in_stage_data = pd.DataFrame()
+        
+        if active_stage_columns:
+            avg_time_in_stage_data = completed_data[active_stage_columns].mean().reset_index()
+            avg_time_in_stage_data.columns = ['Stage', 'Avg Time (Days)'] 
+            avg_time_in_stage = avg_time_in_stage_data.set_index('Stage')['Avg Time (Days)'].sort_values(ascending=False)
+            
+            if not avg_time_in_stage.empty:
+                bottleneck_stage = avg_time_in_stage.index[0]
+        
+        # Metrics for Display
+        avg_cycle_time = completed_data['Cycle_Time_Days'].mean()
+        median_cycle_time = completed_data['Cycle_Time_Days'].median()
+        avg_va_time = completed_data['VA_Time_Days'].mean()
+        avg_nva_time = completed_data['NVA_Time_Days'].mean()
+        throughput = len(completed_data)
+
+        flow_efficiency = (avg_va_time / avg_delivery_lead_time * 100) if avg_delivery_lead_time > 0 else 0
+
+        
+        # Display Metrics in Columns
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        col1.metric("Items Fetched", throughput)
+        col2.metric("Avg. Delivery Lead Time", f"{avg_delivery_lead_time:.2f} days", help="Time from Creation to Delivery.")
+        col3.metric("Avg. Backlog Time (Queue)", f"{avg_backlog_time:.2f} days", help="Delivery Lead Time minus Cycle Time.") 
+        col4.metric("Avg. Cycle Time (Work to Delivery)", f"{avg_cycle_time:.2f} days")
+        col5.metric("Flow Efficiency", f"{flow_efficiency:.1f}%")
+
+        st.info(f"""
+        **ℹ️ What does {flow_efficiency:.1f}% Flow Efficiency mean?**
+        It means that for every 100 hours a ticket is "open", it is only being actively worked on for **{flow_efficiency:.1f} hours**.
+        The remaining time is spent waiting in queues (Backlog, Ready for Dev, etc.).
+        """)
+
+        # Second Row (VA/NVA Breakdown)
+        st.markdown("##### Flow Time Breakdown (Work-to-Delivery)")
+        col_va, col_nva, col_closure, col_median = st.columns(4) 
+        
+        col_va.metric("Value-Added (Work)", f"{avg_va_time:.2f} days", help=f"Sum of: {', '.join(selected_va_stages)}")
+        col_nva.metric("NVA (Wait in Queue)", f"{avg_nva_time:.2f} days", help=f"Sum of: {', '.join(selected_nva_stages)}")
+        col_closure.metric("NVA (Time in Done)", f"{avg_done_time:.2f} days", help=f"Time in '{selected_done_column}'. Excluded from Delivery Lead Time.")
+        col_median.metric("Median Cycle Time", f"{median_cycle_time:.2f} days")
+        
+        st.divider()
+
+        # --- A. CONSTRAINT VISUALIZATION ---
+        st.header("1. Identify and Exploit the Constraint (Current)")
+        st.markdown(f"The system's throughput is limited by the **Primary Constraint**, which is the stage taking the most average time.")
+        
+        if not avg_time_in_stage.empty:
+            st.bar_chart(avg_time_in_stage_data, x='Stage', y='Avg Time (Days)', height=400)
+            st.warning(f"ACTION POINT: The current Constraint is **{bottleneck_stage}** at **{avg_time_in_stage[bottleneck_stage]:.2f} days**.")
+        else:
+            st.warning("Not enough detailed stage data to visualize constraints (History fetch failed).")
+
+        st.divider()
+
+        # --- B. PREDICTIVE WHAT-IF ENGINE ---
+        st.header("2. Predictive 'What-If' Simulation Engine")
+        
+        st.sidebar.markdown("---")
+        st.sidebar.header("Simulation Settings")
+        forecast_items = st.sidebar.slider("Number of items to forecast", 50, 500, 100)
+        
+        if bottleneck_stage != "N/A" and bottleneck_stage in completed_data.columns:
+             improvement_target = st.sidebar.slider(f"Target Improvement for '{bottleneck_stage}' (%)", 0, 50, 20)
+        else:
+             improvement_target = 0
+
+        simulation_runs = st.sidebar.slider("Monte Carlo Runs", 1000, 20000, 10000)
+        
+        # --- Run Baseline ---
+        historical_cycle_times = completed_data['Cycle_Time_Days'].tolist()
+        baseline_results = run_monte_carlo(historical_cycle_times, forecast_items, simulation_runs)
+        
+        # --- Run What-If Scenario ---
+        improved_data = completed_data.copy()
+        improvement_factor = 1 - (improvement_target / 100)
+        
+        simulated_reduction_possible = False
+        if bottleneck_stage != "N/A" and bottleneck_stage in improved_data.columns:
+            improved_data[bottleneck_stage] = improved_data[bottleneck_stage] * improvement_factor
+            simulated_reduction_possible = True
+        
+        if simulated_reduction_possible:
+            # Recalculate improved cycle time
+            improved_data['Improved_Cycle_Time_Days'] = improved_data[active_stage_columns].sum(axis=1)
+            improved_cycle_times = improved_data['Improved_Cycle_Time_Days'].tolist()
+            
+            simulated_avg_reduction = avg_cycle_time - improved_data['Improved_Cycle_Time_Days'].mean()
+            
+            improved_results = run_monte_carlo(improved_cycle_times, forecast_items, simulation_runs)
+        else:
+            # Fallback if no simulation possible
+            improved_results = baseline_results
+            simulated_avg_reduction = 0
+        
+        # Display Results
+        col_baseline, col_whatif = st.columns(2)
+        
+        with col_baseline:
+            st.subheader("Baseline Scenario (Current State)")
+            st.info(f"Avg. time per item: **{avg_cycle_time:.2f} days**")
+            display_forecast(baseline_results, forecast_items)
+            
+        with col_whatif:
+            st.subheader(f"What-If Scenario: {improvement_target}% Reduction in '{bottleneck_stage}'")
+            if simulated_reduction_possible:
+                st.success(f"Simulated avg. time per item: **{improved_data['Improved_Cycle_Time_Days'].mean():.2f} days** (Reduction of {simulated_avg_reduction:.2f} days)")
+                display_forecast(improved_results, forecast_items)
+            else:
+                st.warning("Cannot model improvement (No bottleneck identified or column missing).")
+
+        st.divider()
+        
+        # --- C. PREDICTED NEXT CONSTRAINT ---
+        st.header("3. Predicted Next Constraint (Subordination)")
+        
+        if simulated_reduction_possible:
+            predicted_avg_time_in_stage = improved_data[active_stage_columns].mean().reset_index()
+            predicted_avg_time_in_stage.columns = ['Stage', 'Predicted Avg Time (Days)'] 
+
+            predicted_bottleneck_series = predicted_avg_time_in_stage.set_index('Stage')['Predicted Avg Time (Days)'].sort_values(ascending=False)
+            
+            if not predicted_bottleneck_series.empty:
+                predicted_bottleneck = predicted_bottleneck_series.index[0]
+                predicted_bottleneck_time = predicted_bottleneck_series.iloc[0]
+                
+                col_summary, col_chart = st.columns(2)
+                with col_summary:
+                    st.markdown("---")
+                    st.error(f"⚠️ **NEW BOTTLENECK PREDICTED:**")
+                    st.error(f"The next constraint will be **{predicted_bottleneck}** (Predicted Avg. {predicted_bottleneck_time:.2f} days).")
+                    strategic_gain = baseline_results['p85'] - improved_results['p85']
+                    st.header("🎯 Strategic Gain Summary")
+                    st.success(f"The **85% Confidence delivery window** is predicted to shrink by **{strategic_gain:.2f} days**.")
+
+                with col_chart:
+                     st.bar_chart(predicted_avg_time_in_stage, x='Stage', y='Predicted Avg Time (Days)', height=300)
+        else:
+            st.info("Simulation inactive.")
+
+        st.divider()
+
+        # --- D. TICKET DEEP DIVE ---
+        st.header("4. Individual Ticket Deep Dive")
+        
+        # Combine Key and Summary for dropdown
+        if SUMMARY_COLUMN in completed_data.columns:
+            completed_data['Display_Key'] = completed_data[ID_COLUMN] + ": " + completed_data[SUMMARY_COLUMN].fillna('No Summary Available')
+            combined_display_keys = completed_data['Display_Key'].unique().tolist()
+            selected_combined_key = st.selectbox("Select Issue (Key: Summary)", combined_display_keys)
+            selected_key = selected_combined_key.split(":")[0].strip() if selected_combined_key else None
+        else:
+            issue_keys = completed_data[ID_COLUMN].unique().tolist()
+            selected_key = st.selectbox("Select Issue Key", issue_keys)
+
+        if selected_key:
+            selected_row = completed_data[completed_data[ID_COLUMN] == selected_key].iloc[0]
+            
+            if active_stage_columns:
+                # Prepare data using dynamic active columns
+                deep_dive_data = selected_row[active_stage_columns].reset_index()
+                deep_dive_data.columns = ['Stage', 'Time (Days)']
+                
+                if selected_done_column and selected_done_column in selected_row:
+                     done_time = selected_row[selected_done_column]
+                     deep_dive_data.loc[len(deep_dive_data)] = [f'Time in {selected_done_column}', done_time]
+
+                st.markdown(f"**Issue Summary:** {selected_row.get(SUMMARY_COLUMN, 'N/A')}")
+                col_dd1, col_dd2, col_dd3 = st.columns(3)
+                
+                # Use calculated lead time
+                ticket_total_lead = selected_row.get('Calculated_Lead_Time', selected_row.get(TOTAL_LEAD_TIME_COLUMN, 0))
+                ticket_cycle_time = selected_row['Cycle_Time_Days']
+                ticket_done_time = selected_row.get(selected_done_column, 0)
+                ticket_backlog_time = ticket_total_lead - ticket_cycle_time - ticket_done_time
+                
+                col_dd1.metric("Lead Time", f"{ticket_total_lead:.2f} days")
+                col_dd2.metric("Cycle Time", f"{ticket_cycle_time:.2f} days")
+                col_dd3.metric("Backlog Time", f"{ticket_backlog_time:.2f} days")
+
+                st.bar_chart(deep_dive_data.set_index('Stage'), height=400)
+            else:
+                st.warning("No stage data available for deep dive.")
+
+    except Exception as e:
+        st.error("🚨 **ANALYSIS FAILED**")
+        st.error(f"Error: {e}")
+elif data_source == "Jira API (Live)" and st.session_state['jira_data'] is None:
+    st.info("👈 Please configure your Jira connection in the sidebar.")
+elif data_source == "CSV Upload" and not uploaded_file:
+    pass # Wait for upload
